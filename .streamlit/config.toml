@@ -1,0 +1,3 @@
+# Bird photos are a few MB, so 10 MB is plenty. It also changes the "200MB per file" note in the upload box.
+[server]
+maxUploadSize = 10

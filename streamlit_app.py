@@ -104,10 +104,22 @@ def thumbnail(file):
     return ImageOps.fit(Image.open(f'examples/{file}'), (300, 300))
 
 
-# Streamlit has no setting for the height of the upload box, so I make it taller with a bit of CSS.
+# Streamlit has few settings for the look of the upload box, so I restyle it with a bit of CSS:
+# taller, everything centred and stacked, a dashed border like most drop zones, and a light blue highlight
+# when the mouse is over it, so it is clear a photo can go there. ::before adds the hint text above the button.
+# These selectors use Streamlit's internal names, which is why requirements.txt pins the Streamlit version.
 CSS = """
 <style>
-[data-testid="stFileUploaderDropzone"] {min-height: 170px; align-items: center;}
+[data-testid="stFileUploaderDropzone"] {
+    min-height: 170px; flex-direction: column; justify-content: center; align-items: center; gap: 10px;
+    border: 2px dashed rgba(128, 128, 128, 0.45); transition: border-color 0.2s, background-color 0.2s;
+}
+[data-testid="stFileUploaderDropzone"]:hover {
+    border-color: #1c83e1; background-color: rgba(28, 131, 225, 0.08); cursor: pointer;
+}
+[data-testid="stFileUploaderDropzone"]::before {content: 'Drag and drop a photo here'; font-weight: 600;}
+[data-testid="stFileUploaderDropzone"]:has([data-testid="stFileChip"])::before {content: 'Drop another photo to replace it';}
+[data-testid="stFileUploaderDropzoneInstructions"] {text-align: center;}
 </style>
 """
 
@@ -134,7 +146,7 @@ def pick_example(path):
 # height='stretch', so both boxes grow to the height of the taller one and the two sides always line up.
 left, right = st.columns(2, gap='medium')
 with left, st.container(border=True, height='stretch'):
-    uploaded = st.file_uploader('Drag a bird photo here or click Upload', type=['jpg', 'jpeg', 'png', 'webp'],
+    uploaded = st.file_uploader('Your bird photo', type=['jpg', 'jpeg', 'png', 'webp'],
                                 key=f'upload{st.session_state.upload_key}',
                                 on_change=lambda: st.session_state.update(source='upload'))
     st.caption('Or try one of these photos from the test set:')

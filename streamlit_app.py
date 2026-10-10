@@ -12,7 +12,7 @@ import timm
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 
 WEIGHTS_REPO = 'paing-chan/cub200-convnext-tiny'   # my Hugging Face model repository with final_model.pth
@@ -90,46 +90,77 @@ def predict(model, image):
     return probs, seen, overlay(seen, cam)
 
 
-# Example photos from the test set: five clear ones, plus two tricky ones where the model is unsure
+# Example photos from the test set: six clear ones, plus two tricky ones where the model is unsure
 # (it guesses Ring billed Gull for the California Gull, with the right answer second, and gets the Fox Sparrow
-# right but with only about 40% confidence).
+# right but with only about 40% confidence). Eight photos fill two rows of four.
 EXAMPLES = [('0000.jpg', 'Black footed Albatross'), ('0297.jpg', 'Horned Grebe'), ('0594.jpg', 'White Pelican'),
-            ('0896.jpg', 'Black capped Vireo'), ('1199.jpg', 'Common Yellowthroat'),
+            ('0896.jpg', 'Black capped Vireo'), ('1199.jpg', 'Common Yellowthroat'), ('0096.jpg', 'Cardinal'),
             ('0344.jpg', 'Tricky: California Gull'), ('0711.jpg', 'Tricky: Fox Sparrow')]
+
+
+@st.cache_data
+def thumbnail(file):
+    """Centre-crops an example photo to a square, so every thumbnail has the same size and the labels line up."""
+    return ImageOps.fit(Image.open(f'examples/{file}'), (300, 300))
+
+
+# Streamlit has no setting for the height of the upload box, so I make it taller with a bit of CSS.
+CSS = """
+<style>
+[data-testid="stFileUploaderDropzone"] {min-height: 170px; align-items: center;}
+</style>
+"""
 
 # ---------------- the page ----------------
 st.set_page_config(page_title='Bird Species Classifier', page_icon='🐦', layout='wide')
-st.title('🐦 Bird Species Classifier')
+st.markdown(CSS, unsafe_allow_html=True)
+st.title('Bird Species Classifier')
 st.write('Upload a photo of a bird and my model will guess which of the 200 species from the '
          'Caltech-UCSD Birds 200 dataset it is, and show where in the photo it looked.')
 
-# st.session_state survives the reruns, so I use it to remember which photo is being shown:
-# the uploaded one, or an example the user clicked.
-if 'source' not in st.session_state:
-    st.session_state.source = None
+# st.session_state survives the reruns, so I use it to remember which photo is being shown
+# ('upload' or the path of an example) and a counter that gives the upload box a new key when I want to empty it.
+st.session_state.setdefault('source', None)
+st.session_state.setdefault('upload_key', 0)
 
-left, right = st.columns(2)   # two columns side by side: input on the left, results on the right
-with left:
-    uploaded = st.file_uploader('Bird photo', type=['jpg', 'jpeg', 'png', 'webp'],
+
+def pick_example(path):
+    """Runs when an example is clicked: show that example and empty the upload box, so the two never clash."""
+    st.session_state.source = path
+    st.session_state.upload_key += 1   # a new key makes Streamlit draw a fresh, empty upload box
+
+
+# Two columns side by side: input on the left, results on the right. Each one holds a bordered box with
+# height='stretch', so both boxes grow to the height of the taller one and the two sides always line up.
+left, right = st.columns(2, gap='medium')
+with left, st.container(border=True, height='stretch'):
+    uploaded = st.file_uploader('Drag a bird photo here or click Upload', type=['jpg', 'jpeg', 'png', 'webp'],
+                                key=f'upload{st.session_state.upload_key}',
                                 on_change=lambda: st.session_state.update(source='upload'))
     st.caption('Or try one of these photos from the test set:')
     thumbs = st.columns(4)
     for i, (file, name) in enumerate(EXAMPLES):
+        path = f'examples/{file}'
         with thumbs[i % 4]:   # 4 thumbnails per row
-            st.image(f'examples/{file}', width='stretch')
-            if st.button(name, key=file, width='stretch'):
-                st.session_state.source = f'examples/{file}'
+            st.image(thumbnail(file), width='stretch')
+            # the example being shown gets a filled button, so it is clear which photo the results are for.
+            # on_click runs before the page is redrawn, so the highlight and the results update in the same click.
+            st.button(name, key=file, width='stretch', on_click=pick_example, args=(path,),
+                      type='primary' if st.session_state.source == path else 'secondary')
 
 # work out which image to use (None until the user uploads one or clicks an example)
 image = None
 if st.session_state.source == 'upload' and uploaded is not None:
     image = Image.open(uploaded).convert('RGB')
-elif st.session_state.source and st.session_state.source != 'upload':
+elif st.session_state.source not in (None, 'upload'):
     image = Image.open(st.session_state.source).convert('RGB')
 
-with right:
+with right, st.container(border=True, height='stretch'):
     if image is None:
-        st.info('Upload a photo or click an example to see the prediction.')
+        # empty state: a message in the middle of the box instead of a thin strip at the top
+        with st.container(height='stretch', vertical_alignment='center', horizontal_alignment='center'):
+            st.markdown('#### No photo yet')
+            st.caption('Upload a bird photo or pick one of the examples, and the prediction will appear here.')
     else:
         with st.spinner('Identifying the bird...'):   # first run also downloads the weights, so it can take a while
             probs, seen, heatmap = predict(load_model(), image)
@@ -140,19 +171,18 @@ with right:
         # Because of the temperature scaling the confidence is calibrated, so above 50% the model is more likely
         # right than wrong. Below that it is a guess, and I tell the user to look at the other options too.
         if confidence > 0.5:
-            st.success(f'This looks like a **{name}** ({show_percent(confidence)} confident)', icon='✅')
+            st.success(f'This looks like a **{name}** ({show_percent(confidence)} confident)')
         else:
             st.warning(f'Best guess: **{name}** ({show_percent(confidence)}). '
-                       'Not very sure, so check the other options below too.', icon='⚠️')
+                       'Not very sure, so check the other options below too.')
 
-        st.subheader('Top-5 predictions')
+        st.markdown('**Top-5 predictions**')
         for p, i in zip(top5.values.tolist(), top5.indices.tolist()):
             st.progress(p, text=f'{class_names[i]}: {show_percent(p)}')   # one bar per species
 
         a, b = st.columns(2)   # the crop and its heatmap next to each other, so they are easy to compare
         a.image(seen, caption='What the model sees', width='stretch')
-        b.image(heatmap, caption='Grad-CAM: where it looked', width='stretch')
-        st.caption('Red areas pushed the model most towards its answer, blue areas mattered least.')
+        b.image(heatmap, caption='Grad-CAM: red areas mattered most, blue least', width='stretch')
 
 with st.expander('About the model'):   # collapsed by default, opens when clicked
     st.markdown(f"- Model: `{config['model']}` (ConvNeXt-Tiny), pretrained, then fine-tuned on the bird images at {SIZE}x{SIZE}px\n"

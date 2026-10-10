@@ -1,0 +1,8 @@
+{
+ "model": "convnext_tiny.fb_in22k_ft_in1k",
+ "image_size": 288,
+ "temperature": 0.62,
+ "test_top1": 0.907,
+ "test_per_class": 0.9062,
+ "test_top5": 0.9834
+}

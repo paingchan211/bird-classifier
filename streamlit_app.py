@@ -1,9 +1,7 @@
-# My Streamlit web app. You upload a bird photo and it shows the 5 species it thinks are most likely,
-# plus a Grad-CAM heatmap of where the model looked.
-# It needs app_config.json and classes.txt in the same folder (saved by the last cell of my notebook).
-# The weights file (final_model.pth, 112 MB) is too big for GitHub, so it is stored in my free Hugging Face
-# model repository and downloaded the first time the app starts.
-# Run it on my own PC with:  streamlit run streamlit_app.py
+# Streamlit app: upload a bird photo to see the top-5 predicted species and a Grad-CAM heatmap.
+# Needs app_config.json and classes.txt (exported by my notebook) in the same folder.
+# The weights (final_model.pth) are too big for GitHub, so they are downloaded from Hugging Face.
+# Run locally with:  streamlit run streamlit_app.py
 import json
 import os
 import numpy as np
@@ -15,18 +13,14 @@ from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps
 from torchvision import transforms
 
-WEIGHTS_REPO = 'paing-chan/cub200-convnext-tiny'   # my Hugging Face model repository with final_model.pth
+WEIGHTS_REPO = 'paing-chan/cub200-convnext-tiny'   # Hugging Face repo with final_model.pth
 
-# Settings saved by my notebook: the final model (ConvNeXt-Tiny), its image size (288px), the temperature fitted
-# on the validation set (it fixes the under-confidence caused by label smoothing, so the percentages shown are
-# honest) and its test results. Reading them from a file means the app always matches my last training run.
+# Model name, image size and test results, all saved by the notebook
 config = json.load(open('app_config.json'))
 SIZE = config['image_size']
-TEMPERATURE = config['temperature']
 class_names = open('classes.txt').read().splitlines()
 
-# Same resizing and normalising as the test images in my notebook, otherwise the predictions get worse.
-# For 288px crops the short side is first resized to 329px (the same ratio as 224 / 256).
+# Same preprocessing as the test images in the notebook: resize to 256, centre crop 224, normalise
 crop = transforms.Compose([transforms.Resize(round(SIZE * 256 / 224)), transforms.CenterCrop(SIZE)])
 preprocess = transforms.Compose([
     crop,
@@ -35,64 +29,52 @@ preprocess = transforms.Compose([
 ])
 
 
-# Streamlit reruns this whole script every time the user clicks something. @st.cache_resource makes it load the
-# model only once and keep it in memory, otherwise every click would reload 112 MB of weights.
+# Streamlit reruns the script on every click, so cache the model to load it only once
 @st.cache_resource
 def load_model():
-    # use the local copy if I have one (on my PC), otherwise download it from Hugging Face (on Streamlit Cloud)
+    # use a local copy if there is one, otherwise download from Hugging Face
     path = 'final_model.pth' if os.path.exists('final_model.pth') else hf_hub_download(WEIGHTS_REPO, 'final_model.pth')
-    # Same model as in training. pretrained=False because I load my own fine-tuned weights instead.
-    # It has to be a CNN, because Grad-CAM needs the 2D feature maps of the last convolutional stage.
-    model = timm.create_model(config['model'], pretrained=False, num_classes=200)
+    model = timm.create_model(config['model'], pretrained=False, num_classes=200)   # my own weights are loaded below
     model.load_state_dict(torch.load(path, map_location='cpu'))
-    return model.eval()   # the free Streamlit server has no GPU, so everything runs on the CPU
+    return model.eval()   # runs on CPU, Streamlit Cloud has no GPU
 
 
 def overlay(img, cam):
-    """Lays the Grad-CAM heatmap (values 0 to 1) over the image the model saw, red = most important."""
-    # upscale the small heatmap (9x9 for 288px images) to the image size so every pixel gets a value
-    cam = F.interpolate(cam[None, None], size=img.size[::-1], mode='bilinear')[0, 0].numpy()
-    # simple 'jet' colour map: low values blue, middle green, high values red
-    heat = np.stack([np.clip(1.5 - np.abs(4 * cam - k), 0, 1) for k in (3, 2, 1)], axis=-1)
-    blended = 0.55 * np.asarray(img) / 255 + 0.45 * heat   # 55% photo, 45% heatmap
+    """Draws the Grad-CAM heatmap over the image (red = most important)."""
+    cam = F.interpolate(cam[None, None], size=img.size[::-1], mode='bilinear')[0, 0].numpy()   # 7x7 -> image size
+    heat = np.stack([np.clip(1.5 - np.abs(4 * cam - k), 0, 1) for k in (3, 2, 1)], axis=-1)   # blue -> green -> red
+    blended = 0.55 * np.asarray(img) / 255 + 0.45 * heat
     return Image.fromarray(np.uint8(255 * blended))
 
 
 def show_percent(p):
-    """Formats a probability for the user. Above 99.5% I show '>99%', because no model is ever truly 100% sure."""
+    """Formats a probability, showing '>99%' instead of 100%."""
     return '>99%' if p >= 0.995 else f'{p:.0%}'
 
 
 def predict(model, image):
-    """Returns the probabilities of all 200 species, the crop the model saw and the Grad-CAM heatmap."""
-    x = preprocess(image).unsqueeze(0)   # the model expects a batch, so the shape becomes (1, 3, 288, 288)
+    """Returns the probabilities for all 200 species, the crop the model saw and the Grad-CAM heatmap."""
+    x = preprocess(image).unsqueeze(0)   # add a batch dimension: (1, 3, 224, 224)
 
-    # I run the model in two halves instead of model(x), so I can get at the feature maps in between.
-    # No torch.no_grad() here, because Grad-CAM needs gradients.
-    feats = model.forward_features(x)    # output of the last conv stage: (1, 768, 9, 9)
-    feats.retain_grad()                  # PyTorch normally throws away gradients of in-between tensors, keep this one
-    logits = model.forward_head(feats)   # pooling + final layer, same result as model(x)
+    # Run the model in two parts to keep the feature maps for Grad-CAM (so no torch.no_grad here)
+    feats = model.forward_features(x)    # last conv stage: (1, 768, 7, 7)
+    feats.retain_grad()                  # keep its gradient after backward()
+    logits = model.forward_head(feats)   # pooling + classifier
 
-    # divide the raw scores by the temperature, then softmax turns them into probabilities.
-    # This only changes how confident the model looks, the predicted species stays the same.
-    probs = (logits / TEMPERATURE).softmax(1)[0].detach()
-    top = probs.argmax().item()          # index of the most likely species
+    probs = logits.softmax(1)[0].detach()   # scores -> probabilities
+    top = probs.argmax().item()
 
-    # Grad-CAM, same method as my notebook: backpropagate the score of the predicted species to the feature maps.
-    # The average gradient of each map says how important it is for this species, and the weighted sum of the
-    # maps (only the positive part) shows which areas pushed the model towards its answer.
+    # Grad-CAM: weight each feature map by its average gradient for the predicted species, keep the positive part
     model.zero_grad()
     logits[0, top].backward()
-    weights = feats.grad.mean(dim=(2, 3), keepdim=True)    # importance of each of the 768 channels
-    cam = torch.relu((weights * feats).sum(1))[0].detach() # (9, 9) heatmap
-    cam = cam / (cam.max() + 1e-8)                          # scale to 0..1 (1e-8 avoids dividing by 0)
-    seen = crop(image)                                      # the 288x288 centre crop the model actually used
+    weights = feats.grad.mean(dim=(2, 3), keepdim=True)
+    cam = torch.relu((weights * feats).sum(1))[0].detach()
+    cam = cam / (cam.max() + 1e-8)                          # scale to 0..1
+    seen = crop(image)
     return probs, seen, overlay(seen, cam)
 
 
-# Example photos from the test set: six clear ones, plus two tricky ones where the model is unsure
-# (it guesses Ring billed Gull for the California Gull, with the right answer second, and gets the Fox Sparrow
-# right but with only about 40% confidence). Eight photos fill two rows of four.
+# Example photos from the test set (two rows of four)
 EXAMPLES = [('0000.jpg', 'Black footed Albatross'), ('0297.jpg', 'Horned Grebe'), ('0594.jpg', 'White Pelican'),
             ('0896.jpg', 'Black capped Vireo'), ('1199.jpg', 'Common Yellowthroat'), ('0096.jpg', 'Cardinal'),
             ('0344.jpg', 'Tricky: California Gull'), ('0711.jpg', 'Tricky: Fox Sparrow')]
@@ -100,14 +82,12 @@ EXAMPLES = [('0000.jpg', 'Black footed Albatross'), ('0297.jpg', 'Horned Grebe')
 
 @st.cache_data
 def thumbnail(file):
-    """Centre-crops an example photo to a square, so every thumbnail has the same size and the labels line up."""
+    """Square crop so all thumbnails are the same size."""
     return ImageOps.fit(Image.open(f'examples/{file}'), (300, 300))
 
 
-# Streamlit has few settings for the look of the upload box, so I restyle it with a bit of CSS:
-# taller, everything centred and stacked, a dashed border like most drop zones, and a light blue highlight
-# when the mouse is over it, so it is clear a photo can go there. ::before adds the hint text above the button.
-# These selectors use Streamlit's internal names, which is why requirements.txt pins the Streamlit version.
+# CSS for a bigger, centred upload box with a dashed border and a hover highlight.
+# It uses Streamlit's internal names, so the Streamlit version is pinned in requirements.txt.
 CSS = """
 <style>
 [data-testid="stFileUploaderDropzone"] {
@@ -130,20 +110,18 @@ st.title('Bird Species Classifier')
 st.write('Upload a photo of a bird and my model will guess which of the 200 species from the '
          'Caltech-UCSD Birds 200 dataset it is, and show where in the photo it looked.')
 
-# st.session_state survives the reruns, so I use it to remember which photo is being shown
-# ('upload' or the path of an example) and a counter that gives the upload box a new key when I want to empty it.
+# Kept between reruns: which photo is shown ('upload' or an example path), and a key used to reset the upload box
 st.session_state.setdefault('source', None)
 st.session_state.setdefault('upload_key', 0)
 
 
 def pick_example(path):
-    """Runs when an example is clicked: show that example and empty the upload box, so the two never clash."""
+    """Shows the clicked example and clears the upload box."""
     st.session_state.source = path
-    st.session_state.upload_key += 1   # a new key makes Streamlit draw a fresh, empty upload box
+    st.session_state.upload_key += 1   # a new key gives an empty upload box
 
 
-# Two columns side by side: input on the left, results on the right. Each one holds a bordered box with
-# height='stretch', so both boxes grow to the height of the taller one and the two sides always line up.
+# Input on the left, results on the right. height='stretch' keeps both boxes the same height.
 left, right = st.columns(2, gap='medium')
 with left, st.container(border=True, height='stretch'):
     uploaded = st.file_uploader('Your bird photo', type=['jpg', 'jpeg', 'png', 'webp'],
@@ -153,14 +131,13 @@ with left, st.container(border=True, height='stretch'):
     thumbs = st.columns(4)
     for i, (file, name) in enumerate(EXAMPLES):
         path = f'examples/{file}'
-        with thumbs[i % 4]:   # 4 thumbnails per row
+        with thumbs[i % 4]:
             st.image(thumbnail(file), width='stretch')
-            # the example being shown gets a filled button, so it is clear which photo the results are for.
-            # on_click runs before the page is redrawn, so the highlight and the results update in the same click.
+            # the selected example gets a filled button
             st.button(name, key=file, width='stretch', on_click=pick_example, args=(path,),
                       type='primary' if st.session_state.source == path else 'secondary')
 
-# work out which image to use (None until the user uploads one or clicks an example)
+# The image to classify (None until a photo is uploaded or an example is picked)
 image = None
 if st.session_state.source == 'upload' and uploaded is not None:
     image = Image.open(uploaded).convert('RGB')
@@ -169,19 +146,17 @@ elif st.session_state.source not in (None, 'upload'):
 
 with right, st.container(border=True, height='stretch'):
     if image is None:
-        # empty state: a message in the middle of the box instead of a thin strip at the top
+        # placeholder message, centred in the box
         with st.container(height='stretch', vertical_alignment='center', horizontal_alignment='center'):
             st.markdown('#### No photo yet')
             st.caption('Upload a bird photo or pick one of the examples, and the prediction will appear here.')
     else:
-        with st.spinner('Identifying the bird...'):   # first run also downloads the weights, so it can take a while
+        with st.spinner('Identifying the bird...'):   # the first run also downloads the weights
             probs, seen, heatmap = predict(load_model(), image)
         top5 = probs.topk(5)
         name, confidence = class_names[top5.indices[0]], top5.values[0].item()
 
-        # The answer box: green when the model is confident, amber when it is only guessing.
-        # Because of the temperature scaling the confidence is calibrated, so above 50% the model is more likely
-        # right than wrong. Below that it is a guess, and I tell the user to look at the other options too.
+        # Green if the model is more likely right than wrong (over 50%), amber if it is only guessing
         if confidence > 0.5:
             st.success(f'This looks like a **{name}** ({show_percent(confidence)} confident)')
         else:
@@ -190,16 +165,15 @@ with right, st.container(border=True, height='stretch'):
 
         st.markdown('**Top-5 predictions**')
         for p, i in zip(top5.values.tolist(), top5.indices.tolist()):
-            st.progress(p, text=f'{class_names[i]}: {show_percent(p)}')   # one bar per species
+            st.progress(p, text=f'{class_names[i]}: {show_percent(p)}')
 
-        a, b = st.columns(2)   # the crop and its heatmap next to each other, so they are easy to compare
+        a, b = st.columns(2)   # crop and heatmap side by side
         a.image(seen, caption='What the model sees', width='stretch')
         b.image(heatmap, caption='Grad-CAM: red areas mattered most, blue least', width='stretch')
 
-with st.expander('About the model'):   # collapsed by default, opens when clicked
-    st.markdown(f"- Model: `{config['model']}` (ConvNeXt-Tiny), pretrained, then fine-tuned on the bird images at {SIZE}x{SIZE}px\n"
-                '- Training data: 4,829 images of 200 bird species\n'
+with st.expander('About the model'):
+    st.markdown(f"- Model: `{config['model']}` (ConvNeXt-Tiny), pretrained on ImageNet-1k, then fine-tuned on the bird images at {SIZE}x{SIZE}px\n"
+                '- Training data: all 4,829 training images of 200 bird species (settings were chosen on a 10% validation split first)\n'
                 f"- Test Top-1 accuracy: **{config['test_top1']:.1%}**, average per-class accuracy: "
                 f"**{config['test_per_class']:.1%}**, top-5 accuracy: **{config['test_top5']:.1%}**\n"
-                f'- Confidence calibrated with temperature scaling (T = {TEMPERATURE}), so a shown 80% is right about 80% of the time\n'
                 '- Heatmap made with Grad-CAM on the last convolutional stage of the network')
